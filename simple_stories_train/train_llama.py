@@ -140,6 +140,7 @@ class Config(BaseModel):
     intermediate_checkpoints: bool = Field(
         False, description="Save intermediate checkpoints (done at steps 0, 1, 2, 4, 8, ...)?"
     )
+    eos_token_id: str = Field("<|endoftext|>", description="End of text token for the tokenizer")
 
     @model_validator(mode="after")
     def validate_model(self) -> Self:
@@ -192,9 +193,9 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
-    assert (
-        config.total_batch_size % tokens_per_fwdbwd == 0
-    ), f"Mismatch between batch size and tokens {config.total_batch_size} % {tokens_per_fwdbwd} != 0"
+    assert config.total_batch_size % tokens_per_fwdbwd == 0, (
+        f"Mismatch between batch size and tokens {config.total_batch_size} % {tokens_per_fwdbwd} != 0"
+    )
     grad_accum_steps = config.total_batch_size // tokens_per_fwdbwd
     print0(f"total desired batch size: {config.total_batch_size}")
     print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
@@ -328,12 +329,12 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
                 val_loss = 0.0
                 for _ in range(config.val_max_steps):
                     try:
-                        bat = next(val_loader_iter)
+                        bat = next(val_loader_iter)["input_ids"].to(torch.int)
                     except StopIteration:
                         # No more batches, end the loop
                         break
-                    x = bat[-1:].view(B, T)  # inputs
-                    y = bat[1:].view(B, T)  # targets
+                    x = bat.view(B, T)[:, :-1]  # inputs
+                    y = bat.view(B, T)[:, 1:]  # targets
                     x, y = x.to(device), y.to(device)
                     _, loss = model(x, y, return_logits=False)
                     val_loss += loss.item()
@@ -355,12 +356,16 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             # before we end, let's also do one round of inference
             # we'll kick off the generation with "<|endoftext|>", which designates the start of a
             # new sequence
-            start_ids = [train_tokenizer.token_to_id("[EOS]")]
+            eos_token_id = train_tokenizer.token_to_id(config.eos_token_id)
+            start_ids = [eos_token_id]
             xg = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
             max_new_tokens = 32
             temperature = 1.0
             top_k = 40
-            yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
+            yg = raw_model.generate(
+                xg, max_new_tokens, temperature=temperature, 
+                top_k=top_k, eos_token_id=eos_token_id
+            )
             print0("---------------")
             print0(train_tokenizer.decode(yg[0].tolist()))
             print0("---------------")
@@ -389,10 +394,19 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             try:
                 bat = next(train_loader)["input_ids"].to(torch.int)
             except StopIteration:
-                # No more batches. Break so we can sync existing gradients and exit.
-                print0("No more batches in train_loader. Ending training now.")
-                train_loader_depleted = True
-                break
+                # No more batches. We reload the train loader to finish the iteration
+                print0("No more batches in train_loader. Reloading the train loader")
+                train_loader, _ = create_data_loader(
+                    dataset_config=config.train_dataset_config,
+                    batch_size=B,
+                    buffer_size=1000,
+                    global_seed=0,
+                    ddp_rank=ddp_rank,
+                    ddp_world_size=ddp_world_size,
+                )
+                train_loader = iter(train_loader)
+                bat = next(train_loader)["input_ids"].to(torch.int)
+
             x = bat.view(B, T)[:, :-1]  # inputs
             y = bat.view(B, T)[:, 1:]  # targets
             x, y = x.to(device), y.to(device)
@@ -441,7 +455,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         norm_str = f"norm {norm:.4f}" if norm is not None else ""
         print0(
             f"step {step:4d}/{config.num_iterations} | train loss {lossf:.6f} | {norm_str} | "
-            f"lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
+            f"lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
         )
         # log to wandb
         if config.wandb_project is not None and master_process:
@@ -468,7 +482,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
-    print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
+    print0(f"final {len(timings)} iters avg: {np.mean(timings) * 1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------

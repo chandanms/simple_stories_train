@@ -2,7 +2,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from datasets import Dataset, IterableDataset, load_dataset
+from datasets import Dataset, Features, IterableDataset, Value, load_dataset
 from datasets.distributed import split_dataset_by_node
 from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict
@@ -25,6 +25,7 @@ class DatasetConfig(BaseModel):
     n_ctx: int = 1024
     seed: int | None = None
     column_name: str = "input_ids"
+    data_files: str | None = None
     """The name of the column in the dataset that contains the data (tokenized or non-tokenized).
     Typically 'input_ids' for datasets stored with e2e_sae/scripts/upload_hf_dataset.py, or "tokens"
     for datasets tokenized in TransformerLens (e.g. NeelNanda/pile-10k)."""
@@ -164,9 +165,21 @@ def create_data_loader(
     Returns:
         A tuple of the DataLoader and the tokenizer.
     """
+    # loading the json directly doesnt work for some reason. 
+    # It doesnt automatically recognize the features and has to be given manually
+
+    features = Features({
+        'text': Value('string')
+    })
+
     dataset = load_dataset(
-        dataset_config.name, streaming=dataset_config.streaming, split=dataset_config.split
+        'json',
+        data_files=dataset_config.data_files,
+        streaming=dataset_config.streaming,
+        split=dataset_config.split,
+        features=features
     )
+
     seed = dataset_config.seed if dataset_config.seed is not None else global_seed
     if dataset_config.streaming:
         assert isinstance(dataset, IterableDataset)
@@ -183,15 +196,16 @@ def create_data_loader(
         # Get a sample from the dataset and check if it's tokenized and what the n_ctx is
         # Note that the dataset may be streamed, so we can't just index into it
         sample = next(iter(torch_dataset))[dataset_config.column_name]  # type: ignore
-        assert (
-            isinstance(sample, torch.Tensor) and sample.ndim == 1
-        ), "Expected the dataset to be tokenized."
+        assert isinstance(sample, torch.Tensor) and sample.ndim == 1, (
+            "Expected the dataset to be tokenized."
+        )
         assert len(sample) == dataset_config.n_ctx, "n_ctx does not match the tokenized length."
 
     else:
         torch_dataset = tokenize_and_concatenate(
             dataset,  # type: ignore
             tokenizer,
+            column_name=dataset_config.column_name,
             max_length=dataset_config.n_ctx,
             add_bos_token=False,
         )
