@@ -60,7 +60,7 @@ class CausalSelfAttention(nn.Module):
             self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.attn_bias)
 
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.attn_bias)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = True  # type: ignore
 
         self.register_buffer(
             "bias",
@@ -154,13 +154,13 @@ class CausalSelfAttention(nn.Module):
             q_embed = q_rotated
             k_embed = k_rotated
 
-        return q_embed.to(q.dtype), k_embed.to(k.dtype)  # Ensure original dtype
+        return q_embed.to(q.dtype), k_embed.to(k.dtype)
 
     def forward(
         self,
         x: Float[Tensor, "batch pos d_model"],
         attention_mask: Int[Tensor, "batch offset_pos"] | None = None,
-        position_ids=None,
+        position_ids: Int[Tensor, "batch pos"] | None = None,
         past_key_value: tuple[Tensor, Tensor] | None = None,
     ) -> Float[Tensor, "batch pos d_model"]:
         B, T, C = x.size()  # Batch size, Sequence length, Embedding dimension
@@ -274,12 +274,8 @@ class Block(nn.Module):
         self.mlp = SwiGLUMLP(config)
 
     def forward(self, x: Float[Tensor, "... pos d_model"]) -> Float[Tensor, "... pos d_model"]:
-        ln1 = self.rms_1(x)
-        attn_output = self.attn(ln1)
-        x = x + attn_output
-        ln2 = self.rms_2(x)
-        mlp_output = self.mlp(ln2)
-        x = x + mlp_output
+        x = x + self.attn(self.rms_1(x))
+        x = x + self.mlp(self.rms_2(x))
         return x
 
 
@@ -295,7 +291,8 @@ class Llama(nn.Module):
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.lm_head.LLMC_SKIP_INIT = 1
+        self.lm_head.LLMC_SKIP_INIT = True  # type: ignore
+
         self.transformer.wte.weight = self.lm_head.weight
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
@@ -323,9 +320,9 @@ class Llama(nn.Module):
     ) -> tuple[Float[Tensor, "batch pos"] | None, Float[Tensor, ""] | None]:
         device = idx.device
         b, t = idx.size()
-        assert (
-            t <= self.config.block_size
-        ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        assert t <= self.config.block_size, (
+            f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        )
         tok_emb = self.transformer.wte(idx)
         x = tok_emb
         for block in self.transformer.h:
