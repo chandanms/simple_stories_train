@@ -307,7 +307,8 @@ class Llama(nn.Module):
             )
             if not hasattr(module, "LLMC_SKIP_INIT"):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
-                if module.bias is not None:
+                bias = getattr(module, "bias", None)
+                if bias is not None:
                     torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
