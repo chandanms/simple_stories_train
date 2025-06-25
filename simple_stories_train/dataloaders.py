@@ -196,9 +196,7 @@ def create_data_loader(
         # Load from local file
         tokenizer = Tokenizer.from_file(dataset_config.tokenizer_file_path)
     else:
-        raise ValueError(
-            "Either tokenizer_file_path or hf_tokenizer_path must be specified"
-        )
+        raise ValueError("Either tokenizer_file_path or hf_tokenizer_path must be specified")
 
     torch_dataset: Dataset
     if dataset_config.is_tokenized:
