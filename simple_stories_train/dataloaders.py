@@ -18,9 +18,9 @@ licensed under MIT, (c) 2024 ApolloResearch.
 
 class DatasetConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    name: str = "lennart-finke/SimpleStories"
+    name: str = "SimpleStories/SimpleStories"
     is_tokenized: bool = True
-    tokenizer_file_path: str | None = "simple_stories_train/tokenizer/stories-3072.json"
+    tokenizer_file_path: str | None = "simple_stories_train/tokenizer/simplestories-tokenizer.json"
     hf_tokenizer_path: str | None = None
     streaming: bool = True
     split: str = "train"
