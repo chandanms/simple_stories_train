@@ -5,7 +5,6 @@ This file is inspired from Nix Goldowsky-Dill's adaption of the tokenizer in htt
 from itertools import chain
 from pathlib import Path
 
-from dataloaders import DatasetConfig, create_data_loader
 from datasets import Dataset, DatasetDict, load_dataset
 from tokenizers import AddedToken, Tokenizer
 from tokenizers.decoders import WordPiece as WordPieceDecoder
@@ -16,6 +15,8 @@ from tokenizers.pre_tokenizers import Digits, Punctuation, Sequence, Whitespace
 from tokenizers.processors import TemplateProcessing
 from tokenizers.trainers import WordPieceTrainer
 from tqdm import tqdm
+
+from simple_stories_train.dataloaders import DatasetConfig, create_data_loader
 
 OUT_DIR = Path("tokenizer")
 
