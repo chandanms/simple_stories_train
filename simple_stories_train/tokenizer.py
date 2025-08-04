@@ -2,10 +2,10 @@
 This file is inspired from Nix Goldowsky-Dill's adaption of the tokenizer in https://github.com/juand-r/tiny_tokenizer.
 """
 
-from itertools import chain
+from collections.abc import Generator
 from pathlib import Path
 
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import DatasetDict, IterableDatasetDict, load_dataset
 from tokenizers import AddedToken, Tokenizer
 from tokenizers.decoders import WordPiece as WordPieceDecoder
 from tokenizers.models import WordPiece
@@ -16,8 +16,6 @@ from tokenizers.processors import TemplateProcessing
 from tokenizers.trainers import WordPieceTrainer
 from tqdm import tqdm
 
-from simple_stories_train.dataloaders import DatasetConfig, create_data_loader
-
 OUT_DIR = Path("tokenizer")
 
 # Define common affixes for special handling based on morphological analysis of the dataset
@@ -25,44 +23,44 @@ COMMON_PREFIXES = ["un", "re"]
 COMMON_SUFFIXES = ["ed", "ing", "ly", "er", "ness"]
 
 
-def clean_dataset(dataset="SimpleStories/SimpleStories") -> list[str]:
+def clean_dataset(dataset_name: str, column_name: str) -> Generator[str, None, None]:
     """
-    Load and clean the dataset, implementing lowercase strategy.
-    Returns the entire cleaned dataset as a list of stories.
+    Load and clean the dataset for tokenizer training. We assume that every dataset has some sort of
+    train and validation split.
     """
-    print(f"Loading and cleaning dataset: {dataset}")
-    dataset = load_dataset(dataset, trust_remote_code=False)
+    print(f"Loading and cleaning dataset: {dataset_name}")
+    dataset = load_dataset(dataset_name, trust_remote_code=False, streaming=True)
     trans = str.maketrans(
         {"\u201d": '"', "\u201c": '"', "\u2019": "'", "\u2018": "'", "\u2014": "-", "\u2026": "..."}
     )
 
-    cleaned_data = [
-        s.translate(trans).encode("ascii", "ignore").decode("ascii").lower()
-        for s in dataset["train"]["story"]  # pyright: ignore
-    ]
+    # Check if dataset has multiple splits or no split
+    if isinstance(dataset, DatasetDict | IterableDatasetDict):
+        for split_name, split_data in dataset.items():
+            print(f"Processing {split_name} split...")
+            for story in split_data:
+                if isinstance(story, dict) and column_name in story:
+                    yield (
+                        story[column_name]
+                        .translate(trans)
+                        .encode("ascii", "ignore")
+                        .decode("ascii")
+                        .lower()
+                    )
+    else:
+        print("Processing single split...")
+        for story in dataset:
+            if isinstance(story, dict) and column_name in story:
+                yield (
+                    story[column_name]
+                    .translate(trans)
+                    .encode("ascii", "ignore")
+                    .decode("ascii")
+                    .lower()
+                )
 
-    print(f"Cleaned {len(cleaned_data)} stories")
-    return cleaned_data
 
-
-def create_validation_split(dataset="SimpleStories/SimpleStories") -> DatasetDict:
-    """
-    Create train/validation splits for model training (not tokenizer training).
-    This is separate from tokenizer training and only used for analysis.
-    """
-    cleaned = clean_dataset(dataset)
-
-    # Split into train and validation sets
-    n_train = int(len(cleaned) * 0.9)
-    train, validation = cleaned[:n_train], cleaned[n_train:]
-
-    train_ds = Dataset.from_dict(dict(story=train))
-    validation_ds = Dataset.from_dict(dict(story=validation))
-
-    return DatasetDict({"train": train_ds, "validation": validation_ds})
-
-
-def create_tokenizer(vocab_size=4096) -> Tokenizer:
+def create_tokenizer(vocab_size: int) -> Tokenizer:
     """
     Create a tokenizer with integrated affix handling using Split pre-tokenizers.
 
@@ -103,9 +101,14 @@ def create_tokenizer(vocab_size=4096) -> Tokenizer:
     return tokenizer
 
 
-def train_tokenizer(data: list[str], vocab_size: int = 4096) -> Tokenizer:
+def train_tokenizer(data: Generator[str, None, None], vocab_size: int) -> Tokenizer:
     """
     Train the tokenizer with the specified vocabulary size and cleaned data.
+
+    Note: [UNK] token needs to be specified in two places:
+    1. In special_tokens list - tells the trainer to include it in vocabulary
+    2. Already specified in WordPiece constructor - tells the model which token to
+    use for unknown words
 
     Args:
         data: List of cleaned text strings to train on
@@ -114,7 +117,6 @@ def train_tokenizer(data: list[str], vocab_size: int = 4096) -> Tokenizer:
     Returns:
         Trained Tokenizer object
     """
-    print(f"Training tokenizer on {len(data)} stories with vocab_size {vocab_size}...")
 
     tokenizer = create_tokenizer(vocab_size)
 
@@ -126,7 +128,7 @@ def train_tokenizer(data: list[str], vocab_size: int = 4096) -> Tokenizer:
         vocab_size=vocab_size, special_tokens=special_tokens, initial_alphabet=affixes
     )
 
-    tokenizer.train_from_iterator(data, trainer=trainer, length=len(data))
+    tokenizer.train_from_iterator(data, trainer=trainer)
     print("Tokenizer training completed")
 
     return tokenizer
@@ -150,9 +152,11 @@ def save_tokenizer(tokenizer: Tokenizer, tokenizer_name: str) -> str:
     return tokenizer_path
 
 
-def prune_tokenizer(tokenizer: Tokenizer, dataset_texts: list[str]) -> Tokenizer:
+def prune_tokenizer(data: Generator[str, None, None], tokenizer: Tokenizer) -> Tokenizer:
     """
     Prune tokenizer by removing unused tokens and reordering IDs sequentially.
+    Note: [UNK] token is handled automatically by WordPiece constructor,
+    so it's excluded from add_special_tokens() to avoid duplication.
 
     Args:
         tokenizer: Trained tokenizer object
@@ -164,12 +168,13 @@ def prune_tokenizer(tokenizer: Tokenizer, dataset_texts: list[str]) -> Tokenizer
     original_vocab_size = len(tokenizer.get_vocab())
     print(f"Original vocabulary size: {original_vocab_size}")
 
-    # Always keep special tokens (IDs 0 and 1)
-    special_tokens = {0, 1}
+    # Always keep special tokens
+    special_tokens = get_special_token_ids(tokenizer)
 
     # Find used tokens in dataset
     used_token_ids = set()
-    for text in tqdm(dataset_texts, desc="Tokenizing dataset"):
+
+    for text in tqdm(data, desc="Tokenizing dataset"):
         encoded = tokenizer.encode(text)
         used_token_ids.update(encoded.ids)
 
@@ -194,10 +199,15 @@ def prune_tokenizer(tokenizer: Tokenizer, dataset_texts: list[str]) -> Tokenizer
     # Create new tokenizer
     new_tokenizer: Tokenizer = Tokenizer(WordPiece(vocab=new_vocab, unk_token="[UNK]"))  # type: ignore
 
-    # Add special tokens back
-    new_tokenizer.add_special_tokens(
-        [AddedToken("[UNK]", special=True), AddedToken("[EOS]", special=True)]
-    )
+    # Add back all special tokens (except UNK which is handled by WordPiece constructor)
+    special_tokens_to_add = []
+    for token_id in special_tokens:
+        token_text = tokenizer.id_to_token(token_id)
+        if token_text != "[UNK]":
+            special_tokens_to_add.append(AddedToken(token_text, special=True))
+
+    if special_tokens_to_add:
+        new_tokenizer.add_special_tokens(special_tokens_to_add)
 
     # Copy settings from original
     new_tokenizer.normalizer = tokenizer.normalizer  # type: ignore
@@ -208,39 +218,7 @@ def prune_tokenizer(tokenizer: Tokenizer, dataset_texts: list[str]) -> Tokenizer
     return new_tokenizer
 
 
-def test_tokenizer(filepath: str, dataset: str = "SimpleStories/SimpleStories") -> None:
-    """
-    Test the trained tokenizer on sample data.
-    """
-    dataset_name = dataset
-    split = "train"
-
-    context_width = 512
-    dataset_config = DatasetConfig(
-        name=dataset_name,
-        is_tokenized=False,
-        tokenizer_file_path=filepath,
-        streaming=True,
-        split=split,
-        n_ctx=context_width,
-        seed=42,
-        column_name="story",
-    )
-
-    batch_size = 1
-    buffer_size = 1000
-    global_seed = 0
-
-    loader, tokenizer = create_data_loader(
-        dataset_config, batch_size, buffer_size, global_seed, ddp_rank=0, ddp_world_size=1
-    )
-    batch = next(iter(loader))
-    words = tokenizer.decode_batch(batch["input_ids"].tolist(), skip_special_tokens=False)
-    print("Sample tokenization:")
-    print(words)
-
-
-def load_tokenizer(tokenizer_name="simplestories-4096.json") -> Tokenizer:
+def load_tokenizer(tokenizer_name: str) -> Tokenizer:
     """
     Load a tokenizer from file.
 
@@ -250,54 +228,36 @@ def load_tokenizer(tokenizer_name="simplestories-4096.json") -> Tokenizer:
     return Tokenizer.from_file(f"{OUT_DIR}/{tokenizer_name}")
 
 
-def print_split_words(story_tokens: list[str]) -> None:
-    for i, token in enumerate(story_tokens):
-        if token.startswith("##") and (i == 0 or not story_tokens[i - 1].startswith("##")):
-            word_start = story_tokens[i - 1] if i > 0 else ""
-            word_parts = [token]
+def get_special_token_ids(tokenizer: Tokenizer) -> set[int]:
+    """Get IDs of all added special tokens automatically."""
+    special_token_ids = set()
 
-            for next_token in story_tokens[i + 1 :]:
-                if not next_token.startswith("##"):
-                    break
-                word_parts.append(next_token)
+    # Get all added tokens and check for special tokens
+    for added_token in tokenizer.get_added_tokens_decoder().values():
+        if added_token.special:
+            token_id = tokenizer.token_to_id(str(added_token))
+            if token_id is not None:
+                special_token_ids.add(token_id)
 
-            print(f"{word_start} {' '.join(word_parts)}")
+    # Always include UNK token ID
+    unk_id = tokenizer.token_to_id("[UNK]")
+    if unk_id is not None:
+        special_token_ids.add(unk_id)
 
-
-def analysis(tokenizer_name="simplestories-4096.json") -> None:
-    """
-    Analyze tokenizer performance using a validation split.
-    This creates a fresh validation split for analysis purposes only.
-
-    Args:
-        tokenizer_name: The filename of the tokenizer to analyze
-    """
-    tokenizer = load_tokenizer(tokenizer_name)
-    # Create validation split for analysis
-    validation_stories = create_validation_split(dataset="SimpleStories/SimpleStories")[
-        "validation"
-    ]["story"]
-    tokenized_stories = [tokenizer.encode(story).tokens for story in validation_stories]
-
-    all_tokens = list(chain.from_iterable(tokenized_stories))
-    partial_word_toks = len([token for token in all_tokens if token.startswith("##")])
-
-    print(f"Tokens per story: {len(all_tokens) / len(validation_stories):.2f}")
-    print(f"Proportion of partial word tokens: {partial_word_toks / len(all_tokens):.2%}")
-
-    for story_idx, story_tokens in enumerate(tokenized_stories[:25]):
-        print(f"\nStory {story_idx}")
-        print_split_words(story_tokens)
+    return special_token_ids
 
 
 if __name__ == "__main__":
     vocab_size = 4096
     dataset_name = "SimpleStories/SimpleStories"
+    column_name = "story"
+    save_name = "simplestories-tokenizer.json"
 
-    cleaned_data = clean_dataset(dataset=dataset_name)
+    cleaned_data = clean_dataset(dataset_name, column_name)
+    tokenizer = train_tokenizer(cleaned_data, vocab_size=vocab_size)
 
-    tokenizer = train_tokenizer(data=cleaned_data, vocab_size=vocab_size)
+    # Create fresh iterator since generators can only be consumed once
+    cleaned_data = clean_dataset(dataset_name, column_name)
+    pruned_tokenizer = prune_tokenizer(cleaned_data, tokenizer)
 
-    pruned_tokenizer = prune_tokenizer(tokenizer, cleaned_data)
-
-    save_tokenizer(pruned_tokenizer, "simplestories-tokenizer.json")
+    save_tokenizer(pruned_tokenizer, save_name)

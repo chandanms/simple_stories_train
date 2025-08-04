@@ -1,5 +1,7 @@
 """Simple test for tokenizer pruning functionality."""
 
+from collections.abc import Generator
+
 from tokenizers import Tokenizer
 from tokenizers.models import WordPiece
 from tokenizers.normalizers import Lowercase
@@ -21,14 +23,20 @@ def setup_tokenizer():
     return tokenizer
 
 
-# Global tokenizer and test data for reuse
+# Global tokenizer for reuse
 TEST_TOKENIZER = setup_tokenizer()
-TEST_DATA = ["hello world", "hello there", "world peace"]
+
+
+def create_test_data_iterator(test_data: list[str]) -> Generator[str, None, None]:
+    """Create iterator from test data."""
+    yield from test_data
 
 
 def test_special_tokens_preserved():
     test_data = ["hello world"]
-    pruned = prune_tokenizer(TEST_TOKENIZER, test_data)
+    data_iter = create_test_data_iterator(test_data)
+
+    pruned = prune_tokenizer(data_iter, TEST_TOKENIZER)
     vocab = pruned.get_vocab()
 
     assert "[UNK]" in vocab and "[EOS]" in vocab
@@ -37,13 +45,19 @@ def test_special_tokens_preserved():
 
 def test_unused_tokens_removed():
     original_size = len(TEST_TOKENIZER.get_vocab())
-    pruned = prune_tokenizer(TEST_TOKENIZER, ["hello"])  # Very limited data
+    test_data = ["hello"]  # Very limited data
+    data_iter = create_test_data_iterator(test_data)
+
+    pruned = prune_tokenizer(data_iter, TEST_TOKENIZER)
 
     assert len(pruned.get_vocab()) < original_size
 
 
 def test_functionality_preserved():
-    pruned = prune_tokenizer(TEST_TOKENIZER, ["hello world"])
+    test_data = ["hello world"]
+    data_iter = create_test_data_iterator(test_data)
+
+    pruned = prune_tokenizer(data_iter, TEST_TOKENIZER)
     encoded = pruned.encode("hello world")
     decoded = pruned.decode(encoded.ids)
 
@@ -51,7 +65,10 @@ def test_functionality_preserved():
 
 
 def test_sequential_ids():
-    pruned = prune_tokenizer(TEST_TOKENIZER, ["hello"])
+    test_data = ["hello"]
+    data_iter = create_test_data_iterator(test_data)
+
+    pruned = prune_tokenizer(data_iter, TEST_TOKENIZER)
     token_ids = sorted(pruned.get_vocab().values())
 
     assert token_ids == list(range(len(token_ids)))
