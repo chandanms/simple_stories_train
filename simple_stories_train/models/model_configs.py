@@ -54,7 +54,7 @@ MODEL_CONFIGS = {
     # SimpleStories Model Configs
     "1.25M": LlamaConfig(
         block_size=512,
-        vocab_size=4096,
+        vocab_size=4019,
         n_layer=4,
         n_head=4,
         n_embd=128,
@@ -66,7 +66,7 @@ MODEL_CONFIGS = {
     ),
     "5M": LlamaConfig(
         block_size=512,
-        vocab_size=4096,
+        vocab_size=4019,
         n_layer=6,
         n_head=4,
         n_embd=256,
@@ -78,7 +78,7 @@ MODEL_CONFIGS = {
     ),
     "11M": LlamaConfig(
         block_size=512,
-        vocab_size=4096,
+        vocab_size=4019,
         n_layer=6,
         n_head=6,
         n_embd=384,
@@ -90,7 +90,7 @@ MODEL_CONFIGS = {
     ),
     "30M": LlamaConfig(
         block_size=512,
-        vocab_size=4096,
+        vocab_size=4019,
         n_layer=10,
         n_head=8,
         n_embd=512,
@@ -102,7 +102,7 @@ MODEL_CONFIGS = {
     ),
     "35M": LlamaConfig(
         block_size=512,
-        vocab_size=4096,
+        vocab_size=4019,
         n_layer=12,
         n_head=8,
         n_embd=512,

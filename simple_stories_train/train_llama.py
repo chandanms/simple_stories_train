@@ -73,9 +73,9 @@ class Config(BaseModel):
     )
     train_dataset_config: DatasetConfig = Field(
         DatasetConfig(
-            name="lennart-finke/SimpleStories",
+            name="SimpleStories/SimpleStories",
             is_tokenized=False,
-            tokenizer_file_path="simple_stories_train/tokenizer/stories-3072.json",
+            tokenizer_file_path="simple_stories_train/tokenizer/simplestories-tokenizer.json",
             streaming=True,
             split="train",
             n_ctx=1024,
@@ -86,9 +86,9 @@ class Config(BaseModel):
     )
     val_dataset_config: DatasetConfig = Field(
         DatasetConfig(
-            name="lennart-finke/SimpleStories",
+            name="SimpleStories/SimpleStories",
             is_tokenized=False,
-            tokenizer_file_path="simple_stories_train/tokenizer/stories-3072.json",
+            tokenizer_file_path="simple_stories_train/tokenizer/simplestories-tokenizer.json",
             streaming=True,
             split="test",
             n_ctx=1024,
