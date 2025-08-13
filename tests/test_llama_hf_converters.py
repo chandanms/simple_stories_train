@@ -7,11 +7,11 @@ import torch
 from tokenizers import Tokenizer
 from transformers import AutoTokenizer, LlamaForCausalLM
 
-from simple_stories_train.convert_to_hf import convert_llama_to_llama_for_causal_lm
 from simple_stories_train.models.llama import (
     Llama,
     LlamaConfig,
     convert_llama_for_causal_lm_to_llama,
+    convert_llama_to_llama_for_causal_lm,
 )
 from simple_stories_train.models.model_configs import MODEL_CONFIGS
 

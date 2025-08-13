@@ -2,6 +2,7 @@ import inspect
 import math
 from typing import Any
 from typing import cast as _cast
+from typing import cast as t_cast
 
 import torch
 import torch.nn as nn
@@ -10,8 +11,12 @@ from pydantic import BaseModel, ConfigDict
 from torch import Tensor
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.nn import functional as F
+from transformers import GPT2Config as HFGPT2Config
+from transformers import GPT2LMHeadModel
 
 from simple_stories_train.utils import print0
+
+# pyright: reportAttributeAccessIssue=false, reportIndexIssue=false
 
 
 class GPT2Config(BaseModel):
@@ -358,3 +363,138 @@ class GPT2(nn.Module):
             idx = idx.squeeze(0)
 
         return idx
+
+
+def convert_hf_gpt2_to_gpt2(hf_model: GPT2LMHeadModel) -> "GPT2":
+    """Convert a HuggingFace GPT2LMHeadModel to our custom GPT2.
+
+    Args:
+        hf_model: HuggingFace GPT2LMHeadModel instance
+
+    Returns:
+        Our custom GPT2 model with weights copied from the HF model
+    """
+    hf_config = hf_model.config
+    config = GPT2Config(
+        block_size=hf_config.n_ctx,
+        vocab_size=hf_config.vocab_size,
+        n_layer=hf_config.n_layer,
+        n_head=hf_config.n_head,
+        n_embd=hf_config.n_embd,
+        flash_attention=True,
+    )
+    model = GPT2(config)
+
+    # Embeddings
+    with torch.no_grad():
+        model.wte.weight.copy_(hf_model.transformer.wte.weight)
+        model.wpe.weight.copy_(hf_model.transformer.wpe.weight)
+
+    # Blocks
+    for i in range(config.n_layer):
+        custom_block = model.h[i]
+        hf_block = hf_model.transformer.h[i]
+
+        # Layer norms
+        with torch.no_grad():
+            custom_block.ln_1.weight.copy_(t_cast(Tensor, hf_block.ln_1.weight))
+            custom_block.ln_1.bias.copy_(t_cast(Tensor, hf_block.ln_1.bias))
+            custom_block.ln_2.weight.copy_(t_cast(Tensor, hf_block.ln_2.weight))
+            custom_block.ln_2.bias.copy_(t_cast(Tensor, hf_block.ln_2.bias))
+
+        # Attention (transpose HF Conv1D weights to Linear)
+        with torch.no_grad():
+            custom_block.attn.c_attn.weight.copy_(t_cast(Tensor, hf_block.attn.c_attn.weight).T)
+            custom_block.attn.c_attn.bias.copy_(t_cast(Tensor, hf_block.attn.c_attn.bias))
+
+        with torch.no_grad():
+            custom_block.attn.c_proj.weight.copy_(t_cast(Tensor, hf_block.attn.c_proj.weight).T)
+            custom_block.attn.c_proj.bias.copy_(t_cast(Tensor, hf_block.attn.c_proj.bias))
+
+        # MLP (transpose HF Conv1D weights to Linear)
+        with torch.no_grad():
+            custom_block.mlp.c_fc.weight.copy_(t_cast(Tensor, hf_block.mlp.c_fc.weight).T)
+            custom_block.mlp.c_fc.bias.copy_(t_cast(Tensor, hf_block.mlp.c_fc.bias))
+
+        with torch.no_grad():
+            custom_block.mlp.c_proj.weight.copy_(t_cast(Tensor, hf_block.mlp.c_proj.weight).T)
+            custom_block.mlp.c_proj.bias.copy_(t_cast(Tensor, hf_block.mlp.c_proj.bias))
+
+    # Final ln_f
+    with torch.no_grad():
+        model.ln_f.weight.copy_(hf_model.transformer.ln_f.weight)
+        model.ln_f.bias.copy_(hf_model.transformer.ln_f.bias)
+
+    # LM head
+    with torch.no_grad():
+        model.lm_head.weight.copy_(hf_model.lm_head.weight)
+
+    return model
+
+
+def convert_gpt2_to_hf_gpt2(custom_model: GPT2) -> GPT2LMHeadModel:
+    """Convert custom GPT-2 model to HuggingFace GPT2LMHeadModel.
+
+    Args:
+        custom_model: The custom GPT-2 model to convert
+
+    Returns:
+        The converted HuggingFace GPT2LMHeadModel
+    """
+    model_config: GPT2Config = custom_model.config
+
+    hf_config = HFGPT2Config(
+        vocab_size=model_config.vocab_size,
+        n_positions=model_config.block_size,
+        n_ctx=model_config.block_size,
+        n_layer=model_config.n_layer,
+        n_head=model_config.n_head,
+        n_embd=model_config.n_embd,
+        activation_function="gelu_new",
+        n_inner=None,
+        layer_norm_epsilon=1e-5,
+        # Tie embeddings and lm_head as our implementation does
+        tie_word_embeddings=True,
+    )
+
+    hf_model = GPT2LMHeadModel(hf_config)
+
+    # Embeddings
+    hf_model.transformer.wte.weight.data = custom_model.wte.weight.data
+    hf_model.transformer.wpe.weight.data = custom_model.wpe.weight.data
+
+    # Transformer blocks
+    for i in range(model_config.n_layer):
+        custom_block = custom_model.h[i]
+        hf_block = hf_model.transformer.h[i]
+
+        # LayerNorms
+        hf_block.ln_1.weight.data = custom_block.ln_1.weight.data
+        hf_block.ln_1.bias.data = custom_block.ln_1.bias.data
+        hf_block.ln_2.weight.data = custom_block.ln_2.weight.data
+        hf_block.ln_2.bias.data = custom_block.ln_2.bias.data
+
+        # Attention projections: HF uses Conv1D (weight shape [in, out])
+        # Our Linear weights are [out, in], so transpose when copying to HF
+        hf_block.attn.c_attn.weight.data = custom_block.attn.c_attn.weight.data.t().contiguous()
+        hf_block.attn.c_attn.bias.data = custom_block.attn.c_attn.bias.data
+
+        hf_block.attn.c_proj.weight.data = custom_block.attn.c_proj.weight.data.t().contiguous()
+        hf_block.attn.c_proj.bias.data = custom_block.attn.c_proj.bias.data
+
+        # MLP projections
+        hf_block.mlp.c_fc.weight.data = custom_block.mlp.c_fc.weight.data.t().contiguous()
+        hf_block.mlp.c_fc.bias.data = custom_block.mlp.c_fc.bias.data
+
+        hf_block.mlp.c_proj.weight.data = custom_block.mlp.c_proj.weight.data.t().contiguous()
+        hf_block.mlp.c_proj.bias.data = custom_block.mlp.c_proj.bias.data
+
+    # Final LayerNorm
+    hf_model.transformer.ln_f.weight.data = custom_model.ln_f.weight.data
+    hf_model.transformer.ln_f.bias.data = custom_model.ln_f.bias.data
+
+    # LM head
+    hf_model.lm_head.weight.data = custom_model.lm_head.weight.data
+
+    hf_model.eval()
+    return hf_model
