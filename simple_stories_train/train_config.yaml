@@ -1,3 +1,4 @@
+# wandb_project: spd
 train_dataset_config:
   name: SimpleStories/SimpleStories
   is_tokenized: false
@@ -16,7 +17,8 @@ val_dataset_config:
   n_ctx: 512
   seed: 0
   column_name: story
-model_name: 1.25M
+# model_id: llama-1.25M
+model_id: gpt2-1.25M
 # 1 GPU
 batch_size: 64
 total_batch_size: 32768 # 64 * 512
