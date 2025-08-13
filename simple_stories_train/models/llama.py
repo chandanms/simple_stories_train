@@ -1,18 +1,87 @@
 import inspect
 import math
 import os
+from typing import cast
 
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
 from jaxtyping import Float, Int
 from pydantic import BaseModel, ConfigDict
-from safetensors.torch import load_file
 from torch import Tensor
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.nn import functional as F
+from transformers import LlamaForCausalLM
 
 from simple_stories_train.utils import print0
+
+# pyright: reportAttributeAccessIssue=false, reportIndexIssue=false
+
+
+def convert_llama_for_causal_lm_to_llama(hf_model: LlamaForCausalLM):
+    # Create a matching custom Llama configuration
+    hf_config = hf_model.config
+
+    model_config = LlamaConfig(
+        vocab_size=hf_config.vocab_size,
+        n_layer=hf_config.num_hidden_layers,
+        n_head=hf_config.num_attention_heads,
+        n_embd=hf_config.hidden_size,
+        n_intermediate=hf_config.intermediate_size,
+        rotary_dim=hf_config.hidden_size // hf_config.num_attention_heads,  # Assuming head_dim
+        n_key_value_heads=hf_config.num_key_value_heads,
+    )
+
+    model = Llama(model_config)
+
+    # Convert embeddings
+    model.transformer.wte.weight.data = hf_model.model.embed_tokens.weight.data
+
+    for i in range(hf_config.num_hidden_layers):
+        # RMSNorm 1
+        model.transformer.h[i].rms_1.weight.data = hf_model.model.layers[
+            i
+        ].input_layernorm.weight.data
+
+        # Attention weights
+        model.transformer.h[i].attn.q_attn.weight.data = hf_model.model.layers[
+            i
+        ].self_attn.q_proj.weight.data
+
+        # Key and Value projections - combine separate HF weights into single KV weight
+        k_weight = cast(Tensor, hf_model.model.layers[i].self_attn.k_proj.weight.data)
+        v_weight = cast(Tensor, hf_model.model.layers[i].self_attn.v_proj.weight.data)
+        kv_combined = torch.cat([k_weight, v_weight], dim=0)
+
+        model.transformer.h[i].attn.kv_attn.weight.data = kv_combined
+
+        # Output projection
+        model.transformer.h[i].attn.c_proj.weight.data = hf_model.model.layers[
+            i
+        ].self_attn.o_proj.weight.data
+
+        # RMSNorm 2
+        model.transformer.h[i].rms_2.weight.data = hf_model.model.layers[
+            i
+        ].post_attention_layernorm.weight.data
+
+        # MLP layers
+        model.transformer.h[i].mlp.gate_proj.weight.data = hf_model.model.layers[
+            i
+        ].mlp.gate_proj.weight.data
+        model.transformer.h[i].mlp.up_proj.weight.data = hf_model.model.layers[
+            i
+        ].mlp.up_proj.weight.data
+        model.transformer.h[i].mlp.down_proj.weight.data = hf_model.model.layers[
+            i
+        ].mlp.down_proj.weight.data
+
+    # Final layer norm
+    model.transformer.rms_f.weight.data = hf_model.model.norm.weight.data
+
+    # LM head
+    model.lm_head.weight.data = hf_model.lm_head.weight.data
+
+    return model
 
 
 class LlamaConfig(BaseModel):
@@ -34,6 +103,7 @@ class LlamaConfig(BaseModel):
     )  # Note that llama 3.1 n_key_value_heads does not scale with n_heads
     use_grouped_query_attention: bool = True
     flash_attention: bool = True
+    rms_norm_eps: float = 1e-6
 
 
 class CausalSelfAttention(nn.Module):
@@ -205,8 +275,8 @@ class CausalSelfAttention(nn.Module):
 
         position_ids = position_ids.clamp(max=self.n_ctx - 1)
 
-        cos = self.rotary_cos[position_ids].to(q.dtype)
-        sin = self.rotary_sin[position_ids].to(q.dtype)
+        cos = cast(Tensor, self.rotary_cos)[position_ids].to(q.dtype)
+        sin = cast(Tensor, self.rotary_sin)[position_ids].to(q.dtype)
 
         q, k = self.apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -222,7 +292,7 @@ class CausalSelfAttention(nn.Module):
         else:
             # Manual attention calculation
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            att = att.masked_fill(cast(Tensor, self.bias)[:, :, :T, :T] == 0, float("-inf"))
             att = F.softmax(att, dim=-1)
             y = att @ v  # (B, n_head, T, head_dim)
 
@@ -246,7 +316,7 @@ class SwiGLUMLP(nn.Module):
 
 
 class LlamaRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
+    def __init__(self, hidden_size: int, eps: float):
         """
         LlamaRMSNorm is equivalent to T5LayerNorm
         """
@@ -268,9 +338,9 @@ class LlamaRMSNorm(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
-        self.rms_1 = LlamaRMSNorm(config.n_embd)
+        self.rms_1 = LlamaRMSNorm(config.n_embd, eps=config.rms_norm_eps)
         self.attn = CausalSelfAttention(config)
-        self.rms_2 = LlamaRMSNorm(config.n_embd)
+        self.rms_2 = LlamaRMSNorm(config.n_embd, eps=config.rms_norm_eps)
         self.mlp = SwiGLUMLP(config)
 
     def forward(self, x: Float[Tensor, "... pos d_model"]) -> Float[Tensor, "... pos d_model"]:
@@ -287,7 +357,7 @@ class Llama(nn.Module):
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                rms_f=LlamaRMSNorm(config.n_embd),
+                rms_f=LlamaRMSNorm(config.n_embd, eps=config.rms_norm_eps),
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -324,11 +394,11 @@ class Llama(nn.Module):
         assert t <= self.config.block_size, (
             f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         )
-        tok_emb = self.transformer.wte(idx)
+        tok_emb = self.transformer.wte(idx)  # pyright: ignore[reportCallIssue]
         x = tok_emb
-        for block in self.transformer.h:
+        for block in self.transformer.h:  # pyright: ignore[reportGeneralTypeIssues]
             x = block(x)
-        x = self.transformer.rms_f(x)
+        x = self.transformer.rms_f(x)  # pyright: ignore[reportCallIssue]
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
@@ -344,56 +414,53 @@ class Llama(nn.Module):
     def from_pretrained(
         cls, model_path_or_id: str, config: LlamaConfig, strict: bool = True
     ) -> "Llama":
-        model = cls(config)
         is_local = os.path.exists(model_path_or_id)
+
         if is_local:
+            # Handle local files (existing logic for custom format)
             state_dict = torch.load(model_path_or_id, weights_only=True, map_location="cpu")
-        else:
-            try:
-                weights_path = hf_hub_download(
-                    repo_id=model_path_or_id, filename="model.safetensors"
+            model = cls(config)
+
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+            # Remove rotary_sin and rotary_cos from state_dict to regenerate them
+            keys_to_remove = [
+                k for k in state_dict if k.endswith("rotary_sin") or k.endswith("rotary_cos")
+            ]
+            for k in keys_to_remove:
+                state_dict.pop(k)
+
+            # Load state dict (ignoring rotary buffers)
+            model.load_state_dict(state_dict, strict=strict)
+
+            # Regenerate rotary_sin and rotary_cos for each attention layer
+            for _, block in enumerate(model.transformer.h):  # type: ignore
+                attn = block.attn
+                sin, cos = attn.calculate_sin_cos_rotary(
+                    rotary_dim=attn.rotary_dim,
+                    n_ctx=attn.n_ctx,
+                    base=attn.rotary_base,
+                    dtype=attn.rotary_cos.dtype if hasattr(attn, "rotary_cos") else torch.float32,
                 )
-                state_dict = load_file(weights_path)
-                converted_state_dict = {}
-                for k, v in state_dict.items():
-                    k = k.replace("llama.", "")
-                    if k == "lm_head.weight":
-                        converted_state_dict["lm_head.weight"] = v
-                        converted_state_dict["transformer.wte.weight"] = v
-                    else:
-                        converted_state_dict[k] = v
-                state_dict = converted_state_dict
+                attn.register_buffer("rotary_sin", sin)
+                attn.register_buffer("rotary_cos", cos)
+
+            return model
+
+        else:
+            # Handle HuggingFace Hub models using the conversion function
+            try:
+                hf_model = LlamaForCausalLM.from_pretrained(model_path_or_id)
+
+                model = convert_llama_for_causal_lm_to_llama(hf_model)
+
+                return model
+
             except Exception as err:
                 raise ValueError(
                     f"Error loading model from HuggingFace Hub: {str(err)}. "
                     f"Please ensure the model path or ID '{model_path_or_id}' is correct."
                 ) from err
-
-        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-
-        # Remove rotary_sin and rotary_cos from state_dict to regenerate them
-        keys_to_remove = [
-            k for k in state_dict.keys() if k.endswith("rotary_sin") or k.endswith("rotary_cos")
-        ]
-        for k in keys_to_remove:
-            state_dict.pop(k)
-
-        # Load state dict (ignoring rotary buffers)
-        model.load_state_dict(state_dict, strict=False)
-
-        # Regenerate rotary_sin and rotary_cos for each attention layer
-        for layer_idx, block in enumerate(model.transformer.h):
-            attn = block.attn
-            sin, cos = attn.calculate_sin_cos_rotary(
-                rotary_dim=attn.rotary_dim,
-                n_ctx=attn.n_ctx,
-                base=attn.rotary_base,
-                dtype=attn.rotary_cos.dtype if hasattr(attn, "rotary_cos") else torch.float32,
-            )
-            attn.register_buffer("rotary_sin", sin)
-            attn.register_buffer("rotary_cos", cos)
-
-        return model
 
     def configure_optimizers(
         self,
