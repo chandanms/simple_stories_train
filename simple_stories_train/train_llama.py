@@ -128,6 +128,7 @@ class Config(BaseModel):
     val_max_steps: NonNegativeInt = Field(
         20, description="Max number of batches to use for validation"
     )
+    train_log_every: NonNegativeInt = Field(100, description="How often to log train loss?")
     sample_every: NonNegativeInt = Field(0, description="How often to sample from the model?")
     tensorcores: bool = Field(True, description="Use TensorCores?")
     device: str | None = Field(None, description="Device to use. If None, will autodetect.")
@@ -243,7 +244,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         ddp_rank=ddp_rank,
         ddp_world_size=ddp_world_size,
     )
-    train_loader = iter(train_loader)  # Is this the right way to sample from a Pytorch DataLoader?
+    train_iter = iter(train_loader)
 
     val_loader, _ = create_data_loader(
         dataset_config=config.val_dataset_config,
@@ -253,7 +254,6 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         ddp_rank=ddp_rank,
         ddp_world_size=ddp_world_size,
     )
-    val_loader = iter(val_loader)  # Is this the right way to sample from a Pytorch DataLoader?
 
     # -------------------------------------------------------------------------
     # main training loop
@@ -311,19 +311,15 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    train_loader_depleted = False
     timings = []
     generations = []
     for step in range(1, config.num_iterations + 1):
-        t0 = time.time()
         last_step = step == config.num_iterations
 
         # once in a while evaluate the validation dataset
         if config.val_loss_every > 0 and (step % config.val_loss_every == 0 or last_step):
             model.eval()
-            val_loader_iter = iter(
-                val_loader
-            )  # By creating the iterator anew, we sample the same data each time
+            val_loader_iter = iter(val_loader)
             with torch.no_grad():
                 val_loss = 0.0
                 for _ in range(config.val_max_steps):
@@ -373,7 +369,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         # but also after the very last iteration. so we loop for step <= num_iterations
         # instead of just < num_iterations (one extra due to <=), only to do
         # the validation/sampling one last time, and then we break right here as we're done.
-        if last_step or train_loader_depleted:
+        if last_step:
             break
 
         # --------------- TRAINING SECTION BEGIN -----------------
@@ -384,15 +380,16 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         lossf = Tensor([0.0]).to(
             device
         )  # for getting the mean loss (as simple float) over the accumulation steps
+        t0 = time.time()
         for micro_step in range(grad_accum_steps):
             # fetch a batch
             try:
-                bat = next(train_loader)["input_ids"].to(torch.int)
+                bat = next(train_iter)["input_ids"].to(torch.int)
             except StopIteration:
-                # No more batches. Break so we can sync existing gradients and exit.
-                print0("No more batches in train_loader. Ending training now.")
-                train_loader_depleted = True
-                break
+                # reset the train_loader
+                print0("Depleted train_loader, resetting for next epoch")
+                train_iter = iter(train_loader)
+                bat = next(train_iter)["input_ids"].to(torch.int)
 
             x = bat.view(B, T)[:, :-1]  # inputs
             y = bat.view(B, T)[:, 1:]  # targets
@@ -435,15 +432,16 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             torch.mps.synchronize()
         elif device == "cuda":
             torch.cuda.synchronize()
-        # time and print
-        t1 = time.time()
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1 - t0)
-        norm_str = f"norm {norm:.4f}" if norm is not None else ""
-        print0(
-            f"step {step:4d}/{config.num_iterations} | train loss {lossf:.6f} | {norm_str} | "
-            f"lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
-        )
+        if step % config.train_log_every == 0:
+            # time and print
+            t1 = time.time()
+            # the 0th iteration is often an outlier (much slower) => skip logging it
+            tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1 - t0)
+            norm_str = f"norm {norm:.4f}" if norm is not None else ""
+            print0(
+                f"step {step:4d}/{config.num_iterations} | train loss {lossf:.6f} | {norm_str} | "
+                f"lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
+            )
         # log to wandb
         if config.wandb_project is not None and master_process:
             log_metrics(step, {"train_loss": lossf, "lr": lr})
@@ -458,13 +456,12 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             and (
                 (config.intermediate_checkpoints and is_checkpoint_step(step))
                 or step == config.num_iterations - 1
-                or train_loader_depleted
             )
         ):
             save_model(checkpoints_dir, raw_model, step=step, wandb_project=config.wandb_project)
 
         # keep track of smooth timings, last 20 iterations
-        if step > 1 and (step > config.num_iterations - 20 or train_loader_depleted):
+        if step > 1 and (step > config.num_iterations - 20):
             timings.append(t1 - t0)
 
     # print the average of the last 20 timings, to get something smooth-ish
