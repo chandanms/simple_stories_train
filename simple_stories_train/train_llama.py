@@ -27,7 +27,7 @@ import warnings
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
 import fire
 import numpy as np
@@ -264,7 +264,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         model: nn.Module = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model
 
-    assert isinstance(raw_model, Llama)
+    raw_model = cast(Llama, raw_model)
 
     # init the optimizer
     optimizer = raw_model.configure_optimizers(
