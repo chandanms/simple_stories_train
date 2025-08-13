@@ -255,7 +255,8 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
 
     # logging
     if config.wandb_project is not None and master_process:
-        wandb.init(project=config.wandb_project, config=config.model_dump(mode="json"))
+        run = wandb.init(project=config.wandb_project, config=config.model_dump(mode="json"))
+        run.name = f"{config.model_id}-{run.name}"
 
     # DDP wrap
     if ddp:
@@ -434,6 +435,9 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
 
     if ddp:
         destroy_process_group()
+
+    if config.wandb_project is not None and master_process:
+        wandb.finish()
 
 
 if __name__ == "__main__":
