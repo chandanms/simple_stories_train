@@ -37,6 +37,10 @@ class LlamaConfig(BaseModel):
 
 
 class CausalSelfAttention(nn.Module):
+    bias: Tensor
+    rotary_sin: Tensor
+    rotary_cos: Tensor
+
     def __init__(self, config: LlamaConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -103,7 +107,7 @@ class CausalSelfAttention(nn.Module):
         self,
         past_kv_pos_offset: int,
         attention_mask: Int[Tensor, "batch offset_pos"],
-    ):  # Changed return type hint
+    ) -> Int[Tensor, "batch pos"]:
         shifted_position_ids = attention_mask.cumsum(dim=1) - 1
         position_ids = shifted_position_ids.masked_fill(shifted_position_ids < 0, 0)
         return position_ids[:, past_kv_pos_offset:].long()  # Ensure long type for indexing
@@ -283,22 +287,29 @@ class Llama(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                rms_f=LlamaRMSNorm(config.n_embd),
-            )
+        self.wte: nn.Embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        _blocks: list[Block] = [Block(config) for _ in range(config.n_layer)]
+        self.h_torch: nn.ModuleList = nn.ModuleList(_blocks)
+        # Keep a typed Python list view for static type checking/iteration
+        self.h: list[Block] = _blocks
+        self.rms_f: LlamaRMSNorm = LlamaRMSNorm(config.n_embd)
+        self.transformer: nn.ModuleDict = nn.ModuleDict(
+            {
+                "wte": self.wte,
+                "h": self.h_torch,
+                "rms_f": self.rms_f,
+            }
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.LLMC_SKIP_INIT = True  # type: ignore
 
-        self.transformer.wte.weight = self.lm_head.weight
+        # Tie embeddings and lm_head weights
+        self.wte.weight = self.lm_head.weight  # type: ignore[reportAttributeAccessIssue]
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
         self.apply(self._init_weights)
 
-    def _init_weights(self, module: nn.Module):
+    def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             std = (
                 0.02
@@ -317,18 +328,18 @@ class Llama(nn.Module):
         self,
         idx: Float[Tensor, "batch pos"],
         targets: Float[Tensor, "batch pos vocab"] | None = None,
-        return_logits=True,
-    ) -> tuple[Float[Tensor, "batch pos"] | None, Float[Tensor, ""] | None]:
+        return_logits: bool = True,
+    ) -> tuple[Float[Tensor, "batch pos vocab"] | None, Float[Tensor, ""] | None]:
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, (
             f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         )
-        tok_emb = self.transformer.wte(idx)
+        tok_emb = self.wte(idx)
         x = tok_emb
-        for block in self.transformer.h:
+        for block in self.h:
             x = block(x)
-        x = self.transformer.rms_f(x)
+        x = self.rms_f(x)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
@@ -382,7 +393,7 @@ class Llama(nn.Module):
         model.load_state_dict(state_dict, strict=False)
 
         # Regenerate rotary_sin and rotary_cos for each attention layer
-        for layer_idx, block in enumerate(model.transformer.h):
+        for block in model.h:
             attn = block.attn
             sin, cos = attn.calculate_sin_cos_rotary(
                 rotary_dim=attn.rotary_dim,

@@ -47,7 +47,6 @@ from pydantic import (
     PositiveInt,
     model_validator,
 )
-from torch import Tensor
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -265,6 +264,8 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         model: nn.Module = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model
 
+    assert isinstance(raw_model, Llama)
+
     # init the optimizer
     optimizer = raw_model.configure_optimizers(
         weight_decay=config.weight_decay,
@@ -377,9 +378,8 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         optimizer.zero_grad(set_to_none=True)
 
         # micro-batch loop where we do gradient accumulation to reach desired total batch size
-        lossf = Tensor([0.0]).to(
-            device
-        )  # for getting the mean loss (as simple float) over the accumulation steps
+        lossf = torch.tensor([0.0], device=device)
+        # for getting the mean loss (as simple float) over the accumulation steps
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
             # fetch a batch
@@ -432,10 +432,9 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             torch.mps.synchronize()
         elif device == "cuda":
             torch.cuda.synchronize()
+
+        t1 = time.time()
         if step % config.train_log_every == 0:
-            # time and print
-            t1 = time.time()
-            # the 0th iteration is often an outlier (much slower) => skip logging it
             tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1 - t0)
             norm_str = f"norm {norm:.4f}" if norm is not None else ""
             print0(
