@@ -18,10 +18,6 @@ from tqdm import tqdm
 
 OUT_DIR = Path("tokenizer")
 
-# Define common affixes for special handling based on morphological analysis of the dataset
-COMMON_PREFIXES = ["un", "re"]
-COMMON_SUFFIXES = ["ed", "ing", "ly", "er", "ness"]
-
 
 def clean_dataset(dataset_name: str, column_name: str) -> Generator[str, None, None]:
     """
@@ -121,12 +117,7 @@ def train_tokenizer(data: Generator[str, None, None], vocab_size: int) -> Tokeni
     tokenizer = create_tokenizer(vocab_size)
 
     special_tokens = ["[UNK]", "[EOS]"]
-    affixes = COMMON_PREFIXES + COMMON_SUFFIXES
-
-    # Train the tokenizer
-    trainer = WordPieceTrainer(
-        vocab_size=vocab_size, special_tokens=special_tokens, initial_alphabet=affixes
-    )
+    trainer = WordPieceTrainer(vocab_size=vocab_size, special_tokens=special_tokens)
 
     tokenizer.train_from_iterator(data, trainer=trainer)
     print("Tokenizer training completed")
