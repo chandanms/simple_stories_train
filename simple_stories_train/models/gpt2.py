@@ -1,8 +1,6 @@
 import inspect
 import math
-from typing import Any
-from typing import cast as _cast
-from typing import cast as t_cast
+from typing import Any, Literal, cast
 
 import torch
 import torch.nn as nn
@@ -69,7 +67,8 @@ class CausalSelfAttention(nn.Module):
         x: Float[Tensor, "batch pos d_model"],
     ) -> Float[Tensor, "batch pos d_model"]:
         B, T, C = x.size()
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # calculate q, k, v for all heads in batch
+        # move head dimension forward to be the batch dimension
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
@@ -227,7 +226,7 @@ class GPT2(nn.Module):
         }[model_type]
         config_args["vocab_size"] = 50257
         config_args["block_size"] = 1024
-        config = GPT2Config(**_cast(dict[str, Any], config_args))
+        config = GPT2Config(**cast(dict[str, Any], config_args))
         model = GPT2(config)
 
         sd = model.state_dict()
@@ -244,7 +243,7 @@ class GPT2(nn.Module):
             "mlp.c_fc.weight",
             "mlp.c_proj.weight",
         ]
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # openai checkpoints use a "Conv1D" module; we use a vanilla Linear
         # this means that we have to transpose these weights when we import them
         assert len(sd_keys_hf) == len(sd_keys), (
             f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
@@ -365,7 +364,68 @@ class GPT2(nn.Module):
         return idx
 
 
-def convert_hf_gpt2_to_gpt2(hf_model: GPT2LMHeadModel) -> "GPT2":
+def _build_mapping(
+    direction: Literal["custom_to_hf", "hf_to_custom"], n_layer: int
+) -> list[tuple[str, str, bool]]:
+    base_pairs: list[tuple[str, str, bool]] = [
+        ("wte.weight", "transformer.wte.weight", False),
+        ("wpe.weight", "transformer.wpe.weight", False),
+        ("ln_f.weight", "transformer.ln_f.weight", False),
+        ("ln_f.bias", "transformer.ln_f.bias", False),
+        ("lm_head.weight", "lm_head.weight", False),
+    ]
+
+    layer_pairs: list[tuple[str, str, bool]] = []
+    for i in range(n_layer):
+        c_prefix = f"h_torch.{i}."
+        h_prefix = f"transformer.h.{i}."
+        layer_pairs.extend(
+            [
+                (f"{c_prefix}ln_1.weight", f"{h_prefix}ln_1.weight", False),
+                (f"{c_prefix}ln_1.bias", f"{h_prefix}ln_1.bias", False),
+                (f"{c_prefix}ln_2.weight", f"{h_prefix}ln_2.weight", False),
+                (f"{c_prefix}ln_2.bias", f"{h_prefix}ln_2.bias", False),
+                (f"{c_prefix}attn.c_attn.weight", f"{h_prefix}attn.c_attn.weight", True),
+                (f"{c_prefix}attn.c_attn.bias", f"{h_prefix}attn.c_attn.bias", False),
+                (f"{c_prefix}attn.c_proj.weight", f"{h_prefix}attn.c_proj.weight", True),
+                (f"{c_prefix}attn.c_proj.bias", f"{h_prefix}attn.c_proj.bias", False),
+                (f"{c_prefix}mlp.c_fc.weight", f"{h_prefix}mlp.c_fc.weight", True),
+                (f"{c_prefix}mlp.c_fc.bias", f"{h_prefix}mlp.c_fc.bias", False),
+                (f"{c_prefix}mlp.c_proj.weight", f"{h_prefix}mlp.c_proj.weight", True),
+                (f"{c_prefix}mlp.c_proj.bias", f"{h_prefix}mlp.c_proj.bias", False),
+            ]
+        )
+
+    mapping = base_pairs + layer_pairs
+    if direction == "custom_to_hf":
+        return mapping
+    return [(dst, src, transpose) for (src, dst, transpose) in mapping]
+
+
+def _resolve_tensor(module: nn.Module, path: str) -> Tensor:
+    """Get tensor from module by path.
+
+    E.g. _resolve_tensor(module, "transformer.h.0.attn.c_attn.weight")
+    will return the weight tensor for the first attention layer.
+    """
+
+    obj: Any = module
+    for part in path.split("."):
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    assert isinstance(obj, Tensor)
+    return obj
+
+
+@torch.inference_mode()
+def _copy_by_mapping(src: nn.Module, dst: nn.Module, mapping: list[tuple[str, str, bool]]) -> None:
+    for src_path, dst_path, transpose in mapping:
+        src_tensor = _resolve_tensor(src, src_path)
+        dst_tensor = _resolve_tensor(dst, dst_path)
+        tensor_to_copy = src_tensor.t().contiguous() if transpose else src_tensor
+        dst_tensor.copy_(tensor_to_copy)
+
+
+def convert_hf_gpt2_to_gpt2(hf_model: GPT2LMHeadModel) -> GPT2:
     """Convert a HuggingFace GPT2LMHeadModel to our custom GPT2.
 
     Args:
@@ -374,62 +434,18 @@ def convert_hf_gpt2_to_gpt2(hf_model: GPT2LMHeadModel) -> "GPT2":
     Returns:
         Our custom GPT2 model with weights copied from the HF model
     """
-    hf_config = hf_model.config
-    config = GPT2Config(
-        block_size=hf_config.n_ctx,
-        vocab_size=hf_config.vocab_size,
-        n_layer=hf_config.n_layer,
-        n_head=hf_config.n_head,
-        n_embd=hf_config.n_embd,
+    custom_config = GPT2Config(
+        block_size=hf_model.config.n_ctx,
+        vocab_size=hf_model.config.vocab_size,
+        n_layer=hf_model.config.n_layer,
+        n_head=hf_model.config.n_head,
+        n_embd=hf_model.config.n_embd,
         flash_attention=True,
     )
-    model = GPT2(config)
-
-    # Embeddings
-    with torch.no_grad():
-        model.wte.weight.copy_(hf_model.transformer.wte.weight)
-        model.wpe.weight.copy_(hf_model.transformer.wpe.weight)
-
-    # Blocks
-    for i in range(config.n_layer):
-        custom_block = model.h[i]
-        hf_block = hf_model.transformer.h[i]
-
-        # Layer norms
-        with torch.no_grad():
-            custom_block.ln_1.weight.copy_(t_cast(Tensor, hf_block.ln_1.weight))
-            custom_block.ln_1.bias.copy_(t_cast(Tensor, hf_block.ln_1.bias))
-            custom_block.ln_2.weight.copy_(t_cast(Tensor, hf_block.ln_2.weight))
-            custom_block.ln_2.bias.copy_(t_cast(Tensor, hf_block.ln_2.bias))
-
-        # Attention (transpose HF Conv1D weights to Linear)
-        with torch.no_grad():
-            custom_block.attn.c_attn.weight.copy_(t_cast(Tensor, hf_block.attn.c_attn.weight).T)
-            custom_block.attn.c_attn.bias.copy_(t_cast(Tensor, hf_block.attn.c_attn.bias))
-
-        with torch.no_grad():
-            custom_block.attn.c_proj.weight.copy_(t_cast(Tensor, hf_block.attn.c_proj.weight).T)
-            custom_block.attn.c_proj.bias.copy_(t_cast(Tensor, hf_block.attn.c_proj.bias))
-
-        # MLP (transpose HF Conv1D weights to Linear)
-        with torch.no_grad():
-            custom_block.mlp.c_fc.weight.copy_(t_cast(Tensor, hf_block.mlp.c_fc.weight).T)
-            custom_block.mlp.c_fc.bias.copy_(t_cast(Tensor, hf_block.mlp.c_fc.bias))
-
-        with torch.no_grad():
-            custom_block.mlp.c_proj.weight.copy_(t_cast(Tensor, hf_block.mlp.c_proj.weight).T)
-            custom_block.mlp.c_proj.bias.copy_(t_cast(Tensor, hf_block.mlp.c_proj.bias))
-
-    # Final ln_f
-    with torch.no_grad():
-        model.ln_f.weight.copy_(hf_model.transformer.ln_f.weight)
-        model.ln_f.bias.copy_(hf_model.transformer.ln_f.bias)
-
-    # LM head
-    with torch.no_grad():
-        model.lm_head.weight.copy_(hf_model.lm_head.weight)
-
-    return model
+    custom_model = GPT2(custom_config)
+    mapping = _build_mapping("hf_to_custom", custom_model.config.n_layer)
+    _copy_by_mapping(src=hf_model, dst=custom_model, mapping=mapping)
+    return custom_model
 
 
 def convert_gpt2_to_hf_gpt2(custom_model: GPT2) -> GPT2LMHeadModel:
@@ -441,60 +457,20 @@ def convert_gpt2_to_hf_gpt2(custom_model: GPT2) -> GPT2LMHeadModel:
     Returns:
         The converted HuggingFace GPT2LMHeadModel
     """
-    model_config: GPT2Config = custom_model.config
-
     hf_config = HFGPT2Config(
-        vocab_size=model_config.vocab_size,
-        n_positions=model_config.block_size,
-        n_ctx=model_config.block_size,
-        n_layer=model_config.n_layer,
-        n_head=model_config.n_head,
-        n_embd=model_config.n_embd,
+        vocab_size=custom_model.config.vocab_size,
+        n_positions=custom_model.config.block_size,
+        n_ctx=custom_model.config.block_size,
+        n_layer=custom_model.config.n_layer,
+        n_head=custom_model.config.n_head,
+        n_embd=custom_model.config.n_embd,
         activation_function="gelu_new",
         n_inner=None,
         layer_norm_epsilon=1e-5,
-        # Tie embeddings and lm_head as our implementation does
         tie_word_embeddings=True,
     )
-
     hf_model = GPT2LMHeadModel(hf_config)
-
-    # Embeddings
-    hf_model.transformer.wte.weight.data = custom_model.wte.weight.data
-    hf_model.transformer.wpe.weight.data = custom_model.wpe.weight.data
-
-    # Transformer blocks
-    for i in range(model_config.n_layer):
-        custom_block = custom_model.h[i]
-        hf_block = hf_model.transformer.h[i]
-
-        # LayerNorms
-        hf_block.ln_1.weight.data = custom_block.ln_1.weight.data
-        hf_block.ln_1.bias.data = custom_block.ln_1.bias.data
-        hf_block.ln_2.weight.data = custom_block.ln_2.weight.data
-        hf_block.ln_2.bias.data = custom_block.ln_2.bias.data
-
-        # Attention projections: HF uses Conv1D (weight shape [in, out])
-        # Our Linear weights are [out, in], so transpose when copying to HF
-        hf_block.attn.c_attn.weight.data = custom_block.attn.c_attn.weight.data.t().contiguous()
-        hf_block.attn.c_attn.bias.data = custom_block.attn.c_attn.bias.data
-
-        hf_block.attn.c_proj.weight.data = custom_block.attn.c_proj.weight.data.t().contiguous()
-        hf_block.attn.c_proj.bias.data = custom_block.attn.c_proj.bias.data
-
-        # MLP projections
-        hf_block.mlp.c_fc.weight.data = custom_block.mlp.c_fc.weight.data.t().contiguous()
-        hf_block.mlp.c_fc.bias.data = custom_block.mlp.c_fc.bias.data
-
-        hf_block.mlp.c_proj.weight.data = custom_block.mlp.c_proj.weight.data.t().contiguous()
-        hf_block.mlp.c_proj.bias.data = custom_block.mlp.c_proj.bias.data
-
-    # Final LayerNorm
-    hf_model.transformer.ln_f.weight.data = custom_model.ln_f.weight.data
-    hf_model.transformer.ln_f.bias.data = custom_model.ln_f.bias.data
-
-    # LM head
-    hf_model.lm_head.weight.data = custom_model.lm_head.weight.data
-
+    mapping = _build_mapping("custom_to_hf", custom_model.config.n_layer)
+    _copy_by_mapping(src=custom_model, dst=hf_model, mapping=mapping)
     hf_model.eval()
     return hf_model
