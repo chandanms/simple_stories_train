@@ -1,9 +1,11 @@
+from simple_stories_train.models.gpt2 import GPT2Config
 from simple_stories_train.models.llama import LlamaConfig
 
 MODEL_CONFIGS = {
-    "d2": LlamaConfig(
+    # Llama debug/dev sizes
+    "llama-d2": LlamaConfig(
         block_size=1024,
-        vocab_size=50257,  # TODO: Make this depend on the tokenizer vocab size
+        vocab_size=50257,
         n_layer=2,
         n_head=2,
         n_embd=12,
@@ -11,7 +13,7 @@ MODEL_CONFIGS = {
         n_key_value_heads=2 // 2,
         flash_attention=True,
     ),
-    "d12": LlamaConfig(
+    "llama-d12": LlamaConfig(
         block_size=1024,
         vocab_size=50257,
         n_layer=12,
@@ -21,7 +23,7 @@ MODEL_CONFIGS = {
         n_key_value_heads=12 // 4,
         flash_attention=True,
     ),
-    "d24": LlamaConfig(
+    "llama-d24": LlamaConfig(
         block_size=1024,
         vocab_size=50257,
         n_layer=24,
@@ -31,7 +33,7 @@ MODEL_CONFIGS = {
         n_key_value_heads=16 // 4,
         flash_attention=True,
     ),
-    "d36": LlamaConfig(
+    "llama-d36": LlamaConfig(
         block_size=1024,
         vocab_size=50257,
         n_layer=36,
@@ -41,7 +43,7 @@ MODEL_CONFIGS = {
         n_key_value_heads=20 // 4,
         flash_attention=True,
     ),
-    "d48": LlamaConfig(
+    "llama-d48": LlamaConfig(
         block_size=1024,
         vocab_size=50257,
         n_layer=48,
@@ -51,8 +53,8 @@ MODEL_CONFIGS = {
         n_key_value_heads=25 // 4,
         flash_attention=True,
     ),
-    # SimpleStories Model Configs
-    "1.25M": LlamaConfig(
+    # SimpleStories Llama presets
+    "llama-1.25M": LlamaConfig(
         block_size=512,
         vocab_size=4019,
         n_layer=4,
@@ -64,7 +66,7 @@ MODEL_CONFIGS = {
         n_key_value_heads=2,
         flash_attention=True,
     ),
-    "5M": LlamaConfig(
+    "llama-5M": LlamaConfig(
         block_size=512,
         vocab_size=4019,
         n_layer=6,
@@ -76,7 +78,7 @@ MODEL_CONFIGS = {
         n_key_value_heads=2,
         flash_attention=True,
     ),
-    "11M": LlamaConfig(
+    "llama-11M": LlamaConfig(
         block_size=512,
         vocab_size=4019,
         n_layer=6,
@@ -88,7 +90,7 @@ MODEL_CONFIGS = {
         n_key_value_heads=2,
         flash_attention=True,
     ),
-    "30M": LlamaConfig(
+    "llama-30M": LlamaConfig(
         block_size=512,
         vocab_size=4019,
         n_layer=10,
@@ -100,7 +102,7 @@ MODEL_CONFIGS = {
         n_key_value_heads=2,
         flash_attention=True,
     ),
-    "35M": LlamaConfig(
+    "llama-35M": LlamaConfig(
         block_size=512,
         vocab_size=4019,
         n_layer=12,
@@ -110,6 +112,15 @@ MODEL_CONFIGS = {
         rotary_dim=512 // 8,
         n_ctx=512,
         n_key_value_heads=2,
+        flash_attention=True,
+    ),
+    # GPT-2 presets
+    "gpt2-1.25M": GPT2Config(
+        block_size=512,
+        vocab_size=4019,
+        n_layer=4,
+        n_head=4,
+        n_embd=128,
         flash_attention=True,
     ),
 }

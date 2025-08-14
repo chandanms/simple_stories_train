@@ -1,23 +1,18 @@
 """
-Training script. Currently only supports models with the Llama architecture.
+Unified training script for multiple model families (Llama, GPT-2).
 
 Usage:
+```bash
+python -m simple_stories_train.train [PATH/TO/CONFIG.yaml] [--key1 value1 --key2 value2 ...]
 ```
-python train_llama.py [PATH/TO/CONFIG.yaml] [--key1 value1 --key2 value2 ...]
-```
-where
-- `PATH/TO/CONFIG.yaml` contains the training config. If no path is provided, a default config
-will be used.
-- `--key1 value1 --key2 value2 ...` override values in the config. Note that if you wish to update a
-nested value, you must use dotted notation (e.g. `--train_dataset_config.name my_dataset`).
+- PATH/TO/CONFIG.yaml contains the training config. If no path is provided, a default config will be used.
+- Override values with dotted notation for nested keys (e.g., --train_dataset_config.name my_dataset).
 
-If running on CPU, you may need to set `--compile=False`.
-
-To run on multiple GPUs, use
+To run on multiple GPUs:
+```bash
+torchrun --standalone --nproc_per_node=N -m simple_stories_train.train ...
 ```
-torchrun --standalone --nproc_per_node=N train_llama.py ...
-```
-where `N` is the number of GPUs to use.
+where N is the number of GPUs.
 """
 
 import math
@@ -27,7 +22,7 @@ import warnings
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
 import fire
 import numpy as np
@@ -47,11 +42,11 @@ from pydantic import (
     PositiveInt,
     model_validator,
 )
-from torch import Tensor
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from simple_stories_train.dataloaders import DatasetConfig, create_data_loader
+from simple_stories_train.models.gpt2 import GPT2
 from simple_stories_train.models.llama import Llama
 from simple_stories_train.models.model_configs import MODEL_CONFIGS
 from simple_stories_train.utils import (
@@ -64,6 +59,11 @@ from simple_stories_train.utils import (
     save_config,
     save_model,
 )
+
+FAMILY_TO_MODEL: dict[str, type[nn.Module]] = {
+    "llama": Llama,
+    "gpt2": GPT2,
+}
 
 
 class Config(BaseModel):
@@ -100,18 +100,15 @@ class Config(BaseModel):
     output_dir: Path = Field(
         REPO_ROOT / "out", description="Directory to write logs and checkpoints"
     )
-    model_name: str = Field(
-        "d2",
-        description=f"Name of the model to train (one of {tuple(MODEL_CONFIGS.keys())}). "
-        "Currently only supports models with the Llama architecture.",
+    model_id: str = Field(
+        "llama-d2",
+        description=f"Model to train (one of {tuple(MODEL_CONFIGS.keys())}).",
     )
     batch_size: PositiveInt = Field(4, description="Batch size")
     total_batch_size: PositiveInt = Field(
         4096, description="Number of batch_size * sequence_length before updating gradients"
-    )  # TODO: Rename/reconfigure
-    num_iterations: PositiveInt = Field(
-        50, description="Number of gradient accumulation steps"
-    )  # TODO: Allow for None and deplete the (streaming) dataset
+    )
+    num_iterations: PositiveInt = Field(50, description="Number of gradient accumulation steps")
     inference_only: bool = Field(False, description="If True, don't update gradients")
     learning_rate: PositiveFloat = Field(1e-4, description="Learning rate")
     warmup_iters: NonNegativeInt = Field(
@@ -128,6 +125,7 @@ class Config(BaseModel):
     val_max_steps: NonNegativeInt = Field(
         20, description="Max number of batches to use for validation"
     )
+    train_log_every: NonNegativeInt = Field(100, description="How often to log train loss?")
     sample_every: NonNegativeInt = Field(0, description="How often to sample from the model?")
     tensorcores: bool = Field(True, description="Use TensorCores?")
     device: str | None = Field(None, description="Device to use. If None, will autodetect.")
@@ -143,9 +141,8 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def validate_model(self) -> Self:
-        # Check that the model name is valid
-        if self.model_name not in MODEL_CONFIGS:
-            raise ValueError(f"Model {self.model_name} not in {tuple(MODEL_CONFIGS.keys())}")
+        if self.model_id not in MODEL_CONFIGS:
+            raise ValueError(f"model_id {self.model_id} not in {tuple(MODEL_CONFIGS.keys())}")
         return self
 
 
@@ -158,9 +155,8 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     T = config.train_dataset_config.n_ctx
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
-    ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
+    ddp = int(os.environ.get("RANK", -1)) != -1
     if ddp:
-        # use of DDP atm demands CUDA, we set the device appropriately according to rank
         assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
         init_process_group(backend="nccl")
         ddp_rank = int(os.environ["RANK"])
@@ -168,7 +164,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         ddp_world_size = int(os.environ["WORLD_SIZE"])
         device = f"cuda:{ddp_local_rank}"
         torch.cuda.set_device(device)
-        master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
+        master_process = ddp_rank == 0
         zero_stage = config.zero_stage
     else:
         ddp_rank = 0
@@ -176,12 +172,9 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         zero_stage = 0
         ddp_world_size = 1
         master_process = True
-        # select the device
         if config.device:
-            # provided explicitly by the user
             device = config.device
         else:
-            # attempt to autodetect the device
             device = "cpu"
             if torch.cuda.is_available():
                 device = "cuda"
@@ -190,7 +183,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     print(f"using device: {device}")
     device_type = "cuda" if "cuda" in device else "cpu"
 
-    # calculate gradient accumulation from the desired total batch size and the current run configuration
+    # gradient accumulation
     tokens_per_fwdbwd = B * T * ddp_world_size
     assert config.total_batch_size % tokens_per_fwdbwd == 0, (
         f"Mismatch between batch size and tokens {config.total_batch_size} % {tokens_per_fwdbwd} != 0"
@@ -199,10 +192,12 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     print0(f"total desired batch size: {config.total_batch_size}")
     print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-    # set up a context manager following the desired dtype and device
-    ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[
-        config.dtype
-    ]
+    # dtype context
+    ptdtype = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }[config.dtype]
     ctx = (
         torch.amp.autocast(device_type=device_type, dtype=ptdtype)  # type: ignore
         if device_type == "cuda"
@@ -214,26 +209,30 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
     if torch.cuda.is_available():
         torch.cuda.manual_seed(42)
 
-    # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
-    # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    # TF32
     if config.tensorcores:
         torch.set_float32_matmul_precision("high")
 
-    # init (and write) the tokenizer
-    # enc: tiktoken.core.Encoding = tiktoken.get_encoding("gpt2")
-
-    model_config = MODEL_CONFIGS[config.model_name]
-    model = Llama(model_config)
+    # Instantiate model
+    model_config = MODEL_CONFIGS[config.model_id]
+    family = config.model_id.split("-", 1)[0]
+    if family not in FAMILY_TO_MODEL:
+        raise ValueError(f"Unknown model family {family} from model_id {config.model_id}")
+    model_ctor = FAMILY_TO_MODEL[family]
+    model: nn.Module = model_ctor(model_config)
 
     model.train()
     model.to(device)
     if config.compile:
         if device_type == "cpu":
-            warnings.warn("compile may not be compatible with cpu, use `--compile=False` if issues")
+            warnings.warn(
+                "compile may not be compatible with cpu, use `--compile=False` if issues",
+                stacklevel=1,
+            )
         if hasattr(torch_inductor_config, "coordinate_descent_tuning"):
-            torch_inductor_config.coordinate_descent_tuning = True  # suggested by @Chillee
+            torch_inductor_config.coordinate_descent_tuning = True
         print0("compiling the model...")
-        model: nn.Module = torch.compile(model)  # type: ignore[reportArgumentType]
+        model = cast(nn.Module, torch.compile(model))  # type: ignore[reportArgumentType]
 
     train_loader, train_tokenizer = create_data_loader(
         dataset_config=config.train_dataset_config,
@@ -243,7 +242,7 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         ddp_rank=ddp_rank,
         ddp_world_size=ddp_world_size,
     )
-    train_loader = iter(train_loader)  # Is this the right way to sample from a Pytorch DataLoader?
+    train_iter = iter(train_loader)
 
     val_loader, _ = create_data_loader(
         dataset_config=config.val_dataset_config,
@@ -253,21 +252,19 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         ddp_rank=ddp_rank,
         ddp_world_size=ddp_world_size,
     )
-    val_loader = iter(val_loader)  # Is this the right way to sample from a Pytorch DataLoader?
 
-    # -------------------------------------------------------------------------
-    # main training loop
+    # logging
     if config.wandb_project is not None and master_process:
-        wandb.init(project=config.wandb_project, config=config.model_dump(mode="json"))
+        run = wandb.init(project=config.wandb_project, config=config.model_dump(mode="json"))
+        run.name = f"{config.model_id}-{run.name}"
 
-    # here we wrap model into DDP container
+    # DDP wrap
     if ddp:
-        model: nn.Module = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module if ddp else model  # always contains the "raw" unwrapped model
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model: nn.Module = model.module if ddp else model  # type: ignore[attr-defined]
 
-    assert isinstance(raw_model, Llama)
-    # init the optimizer
-    optimizer = raw_model.configure_optimizers(
+    # optimizer
+    optimizer = raw_model.configure_optimizers(  # type: ignore[attr-defined]
         weight_decay=config.weight_decay,
         learning_rate=config.learning_rate,
         betas=(0.9, 0.95),
@@ -275,22 +272,19 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         zero_stage=zero_stage,
     )
 
-    # learning rate decay scheduler (cosine with warmup)
+    # lr schedule
     def get_lr(it: int) -> float:
         min_lr = config.learning_rate * config.learning_rate_decay_frac
-        # 1) linear warmup for warmup_iters steps
         if it < config.warmup_iters:
             return config.learning_rate * (it + 1) / config.warmup_iters
-        # 2) if it > lr_decay_iters, return min learning rate
         if it > config.num_iterations:
             return min_lr
-        # 3) in between, use cosine decay down to min learning rate
         decay_ratio = (it - config.warmup_iters) / (config.num_iterations - config.warmup_iters)
         assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff starts at 1 and goes to 0
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return min_lr + coeff * (config.learning_rate - min_lr)
 
-    # create the logging directory if it does not exist
+    # IO dirs
     logfile = None
     checkpoints_dir = None
     output_dir = None
@@ -299,11 +293,8 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
         output_dir = Path(config.output_dir) / f"{timestamp}"
         output_dir.mkdir(parents=True, exist_ok=True)
         logfile = output_dir / "main.log"
-        # create the log file "main.log" inside it, and wipe it clean
         with open(logfile, "w") as f:
             pass
-
-        # set our checkpoints directory and save off the initilized model
         checkpoints_dir = output_dir / "checkpoints"
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
         save_config(checkpoints_dir, config_dict=config.model_dump(mode="json"))
@@ -312,146 +303,118 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    train_loader_depleted = False
-    timings = []
-    generations = []
+    timings: list[float] = []
+    generations: list[list[Any]] = []
     for step in range(1, config.num_iterations + 1):
-        t0 = time.time()
         last_step = step == config.num_iterations
 
-        # once in a while evaluate the validation dataset
+        # validation
         if config.val_loss_every > 0 and (step % config.val_loss_every == 0 or last_step):
             model.eval()
-            val_loader_iter = iter(
-                val_loader
-            )  # By creating the iterator anew, we sample the same data each time
+            val_loader_iter = iter(val_loader)
             with torch.no_grad():
                 val_loss = 0.0
                 for _ in range(config.val_max_steps):
                     try:
                         bat = next(val_loader_iter)["input_ids"].to(torch.int)
                     except StopIteration:
-                        # No more batches, end the loop
                         break
-                    x = bat.view(B, T)[:, :-1]  # inputs
-                    y = bat.view(B, T)[:, 1:]  # targets
+                    x = bat.view(B, T)[:, :-1]
+                    y = bat.view(B, T)[:, 1:]
                     x, y = x.to(device), y.to(device)
                     _, loss = model(x, y, return_logits=False)
-                    val_loss += loss.item()
+                    val_loss += float(loss.item()) if loss is not None else 0.0
                 val_loss /= config.val_max_steps
-            # log to wandb
             if config.wandb_project is not None and master_process:
                 log_metrics(step, {"val_loss": val_loss})
-            # log to console and to file
             print0(f"val loss {val_loss}")
             if master_process and logfile is not None:
                 with open(logfile, "a") as f:
-                    f.write("s:%d tel:%f\n" % (step, val_loss))
+                    f.write(f"s:{step} tel:{val_loss}\n")
 
-        # once in a while perform model inference on the master process
+        # sample generations
         if (
             config.sample_every > 0 and (step % config.sample_every == 0 or last_step)
         ) and master_process:
             model.eval()
-            # before we end, let's also do one round of inference
-            # we'll kick off the generation with "<|endoftext|>", which designates the start of a
-            # new sequence
             start_ids = [train_tokenizer.token_to_id("[EOS]")]
             xg = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
             max_new_tokens = 32
             temperature = 1.0
             top_k = 40
-            yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
+            yg = cast(Any, raw_model).generate(
+                xg, max_new_tokens, temperature=temperature, top_k=top_k
+            )
             print0("---------------")
             print0(train_tokenizer.decode(yg[0].tolist()))
             print0("---------------")
-            # log to wandb
             if config.wandb_project is not None and master_process:
                 generations.append([step, train_tokenizer.decode(yg[0].tolist())])
                 log_generations(step, generations)
 
-        # bit confusing: we want to make sure to eval and sample on 0th iteration
-        # but also after the very last iteration. so we loop for step <= num_iterations
-        # instead of just < num_iterations (one extra due to <=), only to do
-        # the validation/sampling one last time, and then we break right here as we're done.
-        if last_step or train_loader_depleted:
+        if last_step:
             break
 
-        # --------------- TRAINING SECTION BEGIN -----------------
+        # training
         model.train()
         optimizer.zero_grad(set_to_none=True)
-
-        # micro-batch loop where we do gradient accumulation to reach desired total batch size
-        lossf = Tensor([0.0]).to(
-            device
-        )  # for getting the mean loss (as simple float) over the accumulation steps
+        lossf = torch.tensor([0.0], device=device)
+        t0 = time.time()
         for micro_step in range(grad_accum_steps):
-            # fetch a batch
             try:
-                bat = next(train_loader)["input_ids"].to(torch.int)
+                bat = next(train_iter)["input_ids"].to(torch.int)
             except StopIteration:
-                # No more batches. Break so we can sync existing gradients and exit.
-                print0("No more batches in train_loader. Ending training now.")
-                train_loader_depleted = True
-                break
+                print0("Depleted train_loader, resetting for next epoch")
+                train_iter = iter(train_loader)
+                bat = next(train_iter)["input_ids"].to(torch.int)
 
-            x = bat.view(B, T)[:, :-1]  # inputs
-            y = bat.view(B, T)[:, 1:]  # targets
+            x = bat.view(B, T)[:, :-1]
+            y = bat.view(B, T)[:, 1:]
             x, y = x.to(device), y.to(device)
             if ddp:
                 # we want only the last micro-step to sync grads in a DDP model
                 # the official way to do this is with model.no_sync(), but that is a
                 # context manager that bloats the code, so we just toggle this variable
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1  # type: ignore
-            # forward pass
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1  # type: ignore[attr-defined]
             with ctx:
                 _, loss = model(x, y, return_logits=False)
                 # we have to scale the loss to account for gradient accumulation,
                 # because the gradients just add on each successive backward().
                 # addition of gradients corresponds to a SUM in the objective, but
                 # instead of a SUM we want MEAN, so we scale the loss here
-                loss = loss / grad_accum_steps
-                lossf += loss.detach()  # keep track of the mean loss
-
-            # backward pass
+                loss = loss / grad_accum_steps  # type: ignore[operator]
+                lossf += loss.detach()  # type: ignore[operator]
             if not config.inference_only:
-                loss.backward()
+                loss.backward()  # type: ignore[arg-type]
         if ddp:
             dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
-        lossf = lossf.item()
+        lossf_value = float(lossf.item())
         norm = None
         if config.grad_clip is not None:
             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        # determine and set the learning rate for this iteration
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-        # step the optimizer
         optimizer.step()
-        # --------------- TRAINING SECTION END -------------------
-        # everything that follows now is just diagnostics, prints, logging, etc.
 
-        # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()
         elif device == "cuda":
             torch.cuda.synchronize()
-        # time and print
+
         t1 = time.time()
-        # the 0th iteration is often an outlier (much slower) => skip logging it
-        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1 - t0)
-        norm_str = f"norm {norm:.4f}" if norm is not None else ""
-        print0(
-            f"step {step:4d}/{config.num_iterations} | train loss {lossf:.6f} | {norm_str} | "
-            f"lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
-        )
-        # log to wandb
+        if step % config.train_log_every == 0:
+            tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1 - t0)
+            norm_str = f"norm {norm:.4f}" if norm is not None else ""
+            print0(
+                f"step {step:4d}/{config.num_iterations} | train loss {lossf_value:.6f} | {norm_str} | "
+                f"lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms | {tokens_per_second:.0f} tok/s)"
+            )
         if config.wandb_project is not None and master_process:
-            log_metrics(step, {"train_loss": lossf, "lr": lr})
-        # log to logile
+            log_metrics(step, {"train_loss": lossf_value, "lr": lr})
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
-                f.write("step:%d loss:%f\n" % (step, lossf))
+                f.write(f"step:{step} loss:{lossf_value}\n")
 
         if (
             checkpoints_dir is not None
@@ -459,24 +422,22 @@ def main(config_path_or_obj: Path | str | Config | None = None, **kwargs: Any) -
             and (
                 (config.intermediate_checkpoints and is_checkpoint_step(step))
                 or step == config.num_iterations - 1
-                or train_loader_depleted
             )
         ):
             save_model(checkpoints_dir, raw_model, step=step, wandb_project=config.wandb_project)
 
-        # keep track of smooth timings, last 20 iterations
-        if step > 1 and (step > config.num_iterations - 20 or train_loader_depleted):
+        if step > 1 and (step > config.num_iterations - 20):
             timings.append(t1 - t0)
 
-    # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings) * 1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
-    # -------------------------------------------------------------------------
-    # clean up nice
     if ddp:
         destroy_process_group()
+
+    if config.wandb_project is not None and master_process:
+        wandb.finish()
 
 
 if __name__ == "__main__":

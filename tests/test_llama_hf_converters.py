@@ -7,8 +7,12 @@ import torch
 from tokenizers import Tokenizer
 from transformers import AutoTokenizer, LlamaForCausalLM
 
-from simple_stories_train.convert_to_hf import convert_llama_to_llama_for_causal_lm
-from simple_stories_train.models.llama import Llama, convert_llama_for_causal_lm_to_llama
+from simple_stories_train.models.llama import (
+    Llama,
+    LlamaConfig,
+    convert_llama_for_causal_lm_to_llama,
+    convert_llama_to_llama_for_causal_lm,
+)
 from simple_stories_train.models.model_configs import MODEL_CONFIGS
 
 
@@ -24,8 +28,10 @@ def test_convert_llama_to_llama_for_causal_lm(
         tokenizer_path: Path to the custom tokenizer
     """
 
+    model_id = f"llama-{model_size}"
     # Load the custom model
-    model_config = MODEL_CONFIGS[model_size]
+    model_config = MODEL_CONFIGS[model_id]
+    assert isinstance(model_config, LlamaConfig)
     custom_model = Llama(model_config)
     custom_model.eval()
 

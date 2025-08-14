@@ -39,10 +39,7 @@ def save_config(save_dir: Path, config_dict: dict[str, Any]) -> None:
 def save_model(
     save_dir: Path, model: nn.Module, step: int, wandb_project: str | None = None
 ) -> None:
-    # Get the underlying model if it's DDP-wrapped
-    state_dict = (
-        model.module.state_dict() if hasattr(model, "module") else model.state_dict()  # pyright: ignore[reportAttributeAccessIssue]
-    )
+    state_dict = model.state_dict()
 
     model_file = save_dir / f"model_step_{step}.pt"
     torch.save(state_dict, model_file)
