@@ -2,7 +2,7 @@
 This file is inspired from Nix Goldowsky-Dill's adaption of the tokenizer in https://github.com/juand-r/tiny_tokenizer.
 """
 
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from pathlib import Path
 
 from datasets import DatasetDict, IterableDatasetDict, load_dataset
@@ -17,10 +17,6 @@ from tokenizers.trainers import WordPieceTrainer
 from tqdm import tqdm
 
 OUT_DIR = Path("tokenizer")
-
-# Define common affixes for special handling based on morphological analysis of the dataset
-COMMON_PREFIXES = ["un", "re"]
-COMMON_SUFFIXES = ["ed", "ing", "ly", "er", "ness"]
 
 
 def clean_dataset(dataset_name: str, column_name: str) -> Generator[str, None, None]:
@@ -101,7 +97,7 @@ def create_tokenizer(vocab_size: int) -> Tokenizer:
     return tokenizer
 
 
-def train_tokenizer(data: Generator[str, None, None], vocab_size: int) -> Tokenizer:
+def train_tokenizer(data: Iterable[str], vocab_size: int) -> Tokenizer:
     """
     Train the tokenizer with the specified vocabulary size and cleaned data.
 
@@ -121,12 +117,7 @@ def train_tokenizer(data: Generator[str, None, None], vocab_size: int) -> Tokeni
     tokenizer = create_tokenizer(vocab_size)
 
     special_tokens = ["[UNK]", "[EOS]"]
-    affixes = COMMON_PREFIXES + COMMON_SUFFIXES
-
-    # Train the tokenizer
-    trainer = WordPieceTrainer(
-        vocab_size=vocab_size, special_tokens=special_tokens, initial_alphabet=affixes
-    )
+    trainer = WordPieceTrainer(vocab_size=vocab_size, special_tokens=special_tokens)
 
     tokenizer.train_from_iterator(data, trainer=trainer)
     print("Tokenizer training completed")
@@ -152,7 +143,7 @@ def save_tokenizer(tokenizer: Tokenizer, tokenizer_name: str) -> str:
     return tokenizer_path
 
 
-def prune_tokenizer(data: Generator[str, None, None], tokenizer: Tokenizer) -> Tokenizer:
+def prune_tokenizer(data: Iterable[str], tokenizer: Tokenizer) -> Tokenizer:
     """
     Prune tokenizer by removing unused tokens and reordering IDs sequentially.
     Note: [UNK] token is handled automatically by WordPiece constructor,
