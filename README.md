@@ -1,14 +1,9 @@
 # simple_stories_train
 
-Project for training small LMs. Designed for training on SimpleStories, an extension of
-[TinyStories](https://arxiv.org/abs/2305.07759).
+Training framework for small language models using SimpleStories, a large-scale synthetic dataset of over 2 million short stories in simple language.
 
-
-- Training script is based on the efficeint [train_gpt2.py](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py) in [llm.c](https://github.com/karpathy/llm.c) (licensed
-  under MIT ((c) 2024 Andrei Karpathy))
-- Some model architecture implementations are based on
-  [TransformerLens](https://github.com/TransformerLensOrg/TransformerLens) (licensed under
-  MIT ((c) 2022 TransformerLensOrg)).
+**Paper:** [Parameterized Synthetic Text Generation with SimpleStories](https://arxiv.org/abs/2504.09184)  
+**Models & Dataset:** [🤗 SimpleStories on Hugging Face](https://huggingface.co/SimpleStories)
 
 ## Installation
 
@@ -37,8 +32,8 @@ make test-all  # Run all tests
 ## Usage
 
 ### Training a model
-```
-python train_llama.py [PATH/TO/CONFIG.yaml] [--key1 value1 --key2 value2 ...]
+```bash
+python -m simple_stories_train.train [PATH/TO/CONFIG.yaml] [--key1 value1 --key2 value2 ...]
 ```
 where
 - `PATH/TO/CONFIG.yaml` contains the training config. If no path is provided, a default config will be used.
@@ -49,10 +44,15 @@ If running on CPU, you may need to set `--compile=False`.
 
 To run on multiple GPUs, use
 ```
-torchrun --standalone --nproc_per_node=N train_llama.py ...
+torchrun --standalone --nproc_per_node=N -m simple_stories_train.train ...
 ```
 where `N` is the number of GPUs to use.
 
 ### Logging with Weights & Biases
 To track training with Weights & Biases, you can set the WANDB_PROJECT and WANDB_API_KEY variables in
 `.env`. API keys can be obtained from your [Weights & Biases account settings](https://wandb.ai/settings).
+
+## Acknowledgments
+
+- Training script is based on the efficient [train_gpt2.py](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py) in [llm.c](https://github.com/karpathy/llm.c) (licensed under MIT ((c) 2024 Andrej Karpathy))
+- Some model architecture implementations are based on [TransformerLens](https://github.com/TransformerLensOrg/TransformerLens) (licensed under MIT ((c) 2022 TransformerLensOrg))
