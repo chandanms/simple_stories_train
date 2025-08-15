@@ -2,7 +2,7 @@
 This file is inspired from Nix Goldowsky-Dill's adaption of the tokenizer in https://github.com/juand-r/tiny_tokenizer.
 """
 
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from pathlib import Path
 
 from datasets import DatasetDict, IterableDatasetDict, load_dataset
@@ -97,7 +97,7 @@ def create_tokenizer(vocab_size: int) -> Tokenizer:
     return tokenizer
 
 
-def train_tokenizer(data: Generator[str, None, None], vocab_size: int) -> Tokenizer:
+def train_tokenizer(data: Iterable[str], vocab_size: int) -> Tokenizer:
     """
     Train the tokenizer with the specified vocabulary size and cleaned data.
 
@@ -143,7 +143,7 @@ def save_tokenizer(tokenizer: Tokenizer, tokenizer_name: str) -> str:
     return tokenizer_path
 
 
-def prune_tokenizer(data: Generator[str, None, None], tokenizer: Tokenizer) -> Tokenizer:
+def prune_tokenizer(data: Iterable[str], tokenizer: Tokenizer) -> Tokenizer:
     """
     Prune tokenizer by removing unused tokens and reordering IDs sequentially.
     Note: [UNK] token is handled automatically by WordPiece constructor,
