@@ -5,6 +5,8 @@ Training framework for small language models using SimpleStories, a large-scale 
 **Paper:** [Parameterized Synthetic Text Generation with SimpleStories](https://arxiv.org/abs/2504.09184)  
 **Models & Dataset:** [🤗 SimpleStories on Hugging Face](https://huggingface.co/SimpleStories)
 
+_Note: This implementation removes the morphological analysis functionality described in the paper (page 5), where common English affixes (prefixes like "un", "re" and suffixes like "ed", "ing", "ly") were included as part of the tokenizer's initial alphabet. Empirical testing showed the WordPiece trainer naturally discovers these morphemes during training, making explicit seeding redundant._
+
 ## Installation
 
 From the root of the repository, run one of
