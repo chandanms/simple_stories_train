@@ -180,7 +180,11 @@ def find_saved_tokenizer(output_dir: Path) -> Path | None:
     if tokenizer_path.exists():
         return tokenizer_path
 
-    # If not found, return None
+    # If not found, return default tokenizer
+    known_default = Path("simple_stories_train/tokenizer/simplestories-tokenizer.json")
+    if known_default.is_file():
+        return known_default.resolve()
+
     return None
 
 
@@ -280,7 +284,8 @@ def main() -> None:
         model_max_len = config.block_size
 
     # Convert and upload tokenizer
-    output_dir = args.checkpoint_path.parent
+    # The models are stored inside checkpoints folder and tokenizer is saved outside
+    output_dir = args.checkpoint_path.parent.parent
     convert_and_upload_tokenizer(
         repo_id=args.repo_id,
         token=args.token,
